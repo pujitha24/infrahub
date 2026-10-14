@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import itertools
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -11,7 +13,7 @@ from infrahub.git.writeback.models import DeliveryProgress, DeliveryQueue, HeldR
 from infrahub.git.writeback.ports import ReplayResult
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 
     from infrahub.git.writeback.models import (
         AbandonmentRecord,
@@ -20,7 +22,6 @@ if TYPE_CHECKING:
         HoldReceipt,
         PendingMerge,
         ReleaseLease,
-        RevertedDelivery,
     )
     from infrahub.git.writeback.ports import Clock
 
@@ -38,7 +39,8 @@ class FixedClock:
         self.now += timedelta(seconds=seconds)
 
 
-class InMemoryDeliveryState:
+# The fake implements every method of the delivery state port.
+class InMemoryDeliveryState:  # noqa: PLR0904
     """The delivery state of each repository in memory, changed by the same transitions as the persisted state.
 
     Every call is recorded in `calls` by its method name, in order. An error that a test appends to
@@ -82,6 +84,11 @@ class InMemoryDeliveryState:
             for repository_id, intent in self.intents.items()
             if intent.status != RepositoryDeliveryStatus.NONE
         )
+
+    @asynccontextmanager
+    async def locked(self, *, repository_id: str) -> AsyncIterator[None]:
+        self._record_call(method="locked")
+        yield
 
     async def enqueue(self, *, repository_id: str, entry: PendingMerge, widen: bool) -> WritebackIntent:
         intent = self._enter(method="enqueue", repository_id=repository_id)
@@ -186,9 +193,17 @@ class InMemoryDeliveryState:
         intent = self._enter(method="touch", repository_id=repository_id)
         self._save(intent=intent.with_progress(now=self.clock()))
 
-    async def record_reverted(self, *, repository_id: str, reverted: RevertedDelivery) -> None:
+    async def forget_delivered_commit(self, *, repository_id: str) -> None:
+        intent = self._enter(method="forget_delivered_commit", repository_id=repository_id)
+        self._save(intent=intent.without_delivered_commit())
+
+    async def record_reverted(self, *, repository_id: str, delivered_commit: str, new_head: str) -> bool:
         intent = self._enter(method="record_reverted", repository_id=repository_id)
-        self._save(intent=intent.with_reverted(reverted=reverted))
+        recorded = intent.with_reverted(delivered_commit=delivered_commit, new_head=new_head, now=self.clock())
+        if recorded is None:
+            return False
+        self._save(intent=recorded)
+        return True
 
     def _enter(self, *, method: str, repository_id: str) -> WritebackIntent:
         self._record_call(method=method)
@@ -209,6 +224,29 @@ class InMemoryDeliveryState:
 
     def _next_lease_id(self) -> str:
         return f"lease-{next(self._lease_numbers)}"
+
+
+@dataclass(frozen=True)
+class RecordedFailure:
+    failure: DeliveryFailure
+    final: bool
+    retry_due_at: datetime | None
+
+
+class RecordingDeliveryState(InMemoryDeliveryState):
+    """Records each failure in `recorded_failures`, in order, then records it as its parent does."""
+
+    def __init__(self, *, clock: Clock, repository_names: Mapping[str, str]) -> None:
+        super().__init__(clock=clock, repository_names=repository_names)
+        self.recorded_failures: list[RecordedFailure] = []
+
+    async def record_failure(
+        self, *, repository_id: str, failure: DeliveryFailure, final: bool, retry_due_at: datetime | None
+    ) -> None:
+        self.recorded_failures.append(RecordedFailure(failure=failure, final=final, retry_due_at=retry_due_at))
+        await super().record_failure(
+            repository_id=repository_id, failure=failure, final=final, retry_due_at=retry_due_at
+        )
 
 
 class InMemoryDeliveryGit:
@@ -339,4 +377,83 @@ class RecordingRegenerationReleaser:
         if self.failures:
             raise self.failures.pop(0)
         await renew()
+        self.releases.append(Release(repository_id=repository_id, held=held))
+
+
+class InMemoryDeliveryRunQuery:
+    """Answers from the delivery runs that a test adds by repository id, to `queued` or to `running`.
+
+    A run in `queued` waits to start, and a run in `running` runs. Every question is recorded in `asked` as the
+    method name and the repository id, in order.
+    """
+
+    def __init__(self) -> None:
+        self.queued: set[str] = set()
+        self.running: set[str] = set()
+        self.asked: list[tuple[str, str]] = []
+
+    async def has_queued_run(self, *, repository_id: str) -> bool:
+        self.asked.append(("has_queued_run", repository_id))
+        return repository_id in self.queued
+
+    async def has_active_run(self, *, repository_id: str) -> bool:
+        self.asked.append(("has_active_run", repository_id))
+        return repository_id in self.queued or repository_id in self.running
+
+
+class FailingDeliveryRunQuery:
+    """Raises the error on every query, as when the orchestrator does not answer.
+
+    Every question is recorded in `asked` as the method name and the repository id, in order, before it raises.
+    """
+
+    def __init__(self, *, error: Exception) -> None:
+        self.error = error
+        self.asked: list[tuple[str, str]] = []
+
+    async def has_queued_run(self, *, repository_id: str) -> bool:
+        self.asked.append(("has_queued_run", repository_id))
+        raise self.error
+
+    async def has_active_run(self, *, repository_id: str) -> bool:
+        self.asked.append(("has_active_run", repository_id))
+        raise self.error
+
+
+@dataclass(frozen=True)
+class Renewal:
+    repository_id: str
+    lease_id: str
+
+
+class RecordingLeaseRenewal:
+    """Records each renewal of a lease that it is asked for, a failed one included, and sets `renewed_twice` at two.
+
+    An error that a test appends to `failures` is raised by the next renewal, after it is recorded.
+    """
+
+    def __init__(self) -> None:
+        self.renewals: list[Renewal] = []
+        self.failures: list[BaseException] = []
+        self.renewed_twice = asyncio.Event()
+
+    async def renew_lease(self, *, repository_id: str, lease_id: str) -> None:
+        self.renewals.append(Renewal(repository_id=repository_id, lease_id=lease_id))
+        if len(self.renewals) == 2:
+            self.renewed_twice.set()
+        if self.failures:
+            raise self.failures.pop(0)
+
+
+class RenewalAwaitingReleaser(RecordingRegenerationReleaser):
+    """Returns once the lease was renewed twice, and never renews it itself, so each renewal comes from elsewhere."""
+
+    def __init__(self, *, renewed_twice: asyncio.Event) -> None:
+        super().__init__()
+        self.renewed_twice = renewed_twice
+
+    async def release(
+        self, *, repository_id: str, held: HeldRegeneration, renew: Callable[[], Awaitable[None]]
+    ) -> None:
+        await asyncio.wait_for(self.renewed_twice.wait(), timeout=5)
         self.releases.append(Release(repository_id=repository_id, held=held))

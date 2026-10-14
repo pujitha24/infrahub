@@ -36,6 +36,10 @@ Deployment has one extra rule, below.
 | **IFC-3210 rewrite classification on `develop`** | T100 | Patrick Ogenstad |
 | **Merge order agreed with IFC-3210** (`collect_pending_imports`, the ancestry primitive, the merge-path check) | T029, T039 | Patrick Ogenstad |
 
+T085 to T092 are done on the provisional answers of spec decisions 1 and 15, which are not
+confirmed yet. A different answer reopens them. The GraphQL and authorization sign-off that T087
+needs is given.
+
 ## Deployment rule
 
 **No deployment ships Phase 3 without T061 to T069 and T074 to T076 of Phase 5, T077, T079 and
@@ -238,8 +242,9 @@ Parts A and B of the plan.
       mapping that sets a read-only attribute of the target kind, and refuse the conversion of a
       `CoreRepository` while its status is not `none` or held regeneration waits. The
       `ConvertObjectType` mutation passes the store. Test each refusal through the mutation in
-      `backend/tests/component/git/writeback/test_repository_conversion.py`. The check takes no state
-      lock, so a merge queued between the check and the deletion is still dropped (spec edge case).
+      `backend/tests/component/git/writeback/test_repository_conversion.py`. The check and the deletion
+      hold the delivery-state lock, inside the repository lock, so a merge queued during a conversion
+      waits for it and then fails on the deleted repository.
 
 **Checkpoint**: the state can be read and written, by one store, on the default branch only.
 
@@ -263,8 +268,8 @@ SC-002, SC-007.
       implementing `DeliveryGitPort` over one `InfrahubRepository`, per contracts section 4.
       `is_ancestor` uses `git merge-base --is-ancestor`, returns `False` only for "no" or a missing
       object, and raises otherwise. `fetch` raises `RepositoryError` on a clone with no `origin`.
-      Every Git command it runs gets a time limit, per [research.md](research.md) R6 (the limit
-      does not stop a hung fetch or push; open point of R6): `FETCH_TIMEOUT_SECONDS` for the
+      Every Git command it runs gets a time limit, per [research.md](research.md) R6 (Git's
+      low-speed limit ends a stalled HTTP(S) fetch or push; SSH has no bound): `FETCH_TIMEOUT_SECONDS` for the
       fetch, `PUSH_TIMEOUT_SECONDS` for the push and `delete_remote_branch`, and
       `LOCAL_GIT_TIMEOUT_SECONDS` for each local
       command, `remote_head`'s `git rev-parse` included. A killed local command removes a left-over
@@ -342,14 +347,14 @@ SC-002, SC-007.
 
 ### No other import of the pending destination
 
-- [ ] T039 [US1] Change `InfrahubRepository.collect_pending_imports` in
+- [X] T039 [US1] Change `InfrahubRepository.collect_pending_imports` in
       `backend/infrahub/git/repository.py`: in the active loop, skip the default branch, and every new
       or updated remote branch that a pending entry names, while the state is not `none`. Leave
       `_collect_staging_imports` unchanged. Pass the state port in from the sync flow in
       `backend/infrahub/git/tasks.py` and `backend/infrahub/git/sync.py`.
-- [ ] T040 [US1] Change `bootstrap_local_repository` in `backend/infrahub/git/tasks.py`: skip the seed
+- [X] T040 [US1] Change `bootstrap_local_repository` in `backend/infrahub/git/tasks.py`: skip the seed
       import of the default branch while the state is not `none`, and log it.
-- [ ] T041 [US1] Change `ProcessRepository.mutate` in `backend/infrahub/graphql/mutations/repository.py`:
+- [X] T041 [US1] Change `ProcessRepository.mutate` in `backend/infrahub/graphql/mutations/repository.py`:
       refuse on every branch while the state is not `none`, with the message of the GraphQL
       contract section 3.
 
@@ -380,7 +385,7 @@ SC-002, SC-007.
       workflow; and a run with no `pending_merge` and no content queues nothing. The case of a flow
       whose own enqueue fails once and then delivers moved to T077, because it needs the retries of
       the task.
-- [ ] T046 [P] [US1] Write `backend/tests/component/git/writeback/test_import_deferral.py`: the sync skips
+- [X] T046 [P] [US1] Write `backend/tests/component/git/writeback/test_import_deferral.py`: the sync skips
       the default branch and a named source branch, as new and as updated, while pending; the seed
       import skips the default branch; and `ProcessRepository` refuses on two branches.
 
@@ -504,16 +509,17 @@ deployment rule.** T070 to T073 are not.
       release all three: the artifact trigger, the generator request and the Python submission.
 - [X] T069 [US3] Wire the releaser into `build_writeback_service` in
       `backend/infrahub/git/writeback/factory.py`, so a delivery releases (R4 step 16).
-- [ ] T070 [US3] Keep the repository id per attribute in `GatheredPythonReadSets` and expose `owner_of` in
-      `backend/infrahub/core/merge/python_target_sources.py`.
-- [ ] T071 [US3] Consult the barrier in `_resolve_python_targets` in
+- [X] T070 [US3] Keep the repository id per attribute in `GatheredPythonReadSets`, in
+      `backend/infrahub/core/merge/python_target_sources.py`, and expose `owner_of` on the Python target
+      resolver, in `backend/infrahub/core/merge/python_target_resolution.py`.
+- [X] T071 [US3] Consult the barrier in `_resolve_python_targets` in
       `backend/infrahub/core/merge/recompute_coalescing.py`, for `MergeRecomputeCoordinator` and
       `RecomputeChainSubmitter`, which gain a required `barrier` parameter. Wire it in
       `backend/infrahub/core/merge/builder.py`, `backend/infrahub/core/recompute/dispatch.py` and the
       rebase builder in `backend/infrahub/core/branch/tasks.py`. Coordinate with IFC-3002.
-- [ ] T072 [US3] Consult the barrier in `computed_attribute_setup_python` in
+- [X] T072 [US3] Consult the barrier in `computed_attribute_setup_python` in
       `backend/infrahub/computed_attribute/tasks.py`, on the default branch.
-- [ ] T073 [P] [US3] Add Python-family cases to `backend/tests/unit/core/merge/test_regeneration_barrier.py`:
+- [X] T073 [P] [US3] Add Python-family cases to `backend/tests/unit/core/merge/test_regeneration_barrier.py`:
       a resolved target and a widened target are both filtered, and a rebase admits everything.
 - [X] T074 [US3] Write `backend/tests/component/core/merge/test_held_regeneration.py`: Y dispatched, X held;
       one release for X after the delivery, against the delivered commit; a deleted held definition
@@ -539,16 +545,18 @@ deployment rule.** T070 to T073 are not.
 **Maps to**: FR-004, FR-027, SC-003. **T077, T079 and T080 are in the deployment rule.** T078 and
 T081 to T084 are not.
 
-- [ ] T077 [US4] Give `deliver_pending_merges` in `backend/infrahub/git/tasks.py` its `retries`,
+- [X] T077 [US4] Give `deliver_pending_merges` in `backend/infrahub/git/tasks.py` its `retries`,
       `retry_delay_seconds` and `retry_condition_fn`, and compute `final_attempt` from
       `task_run.run_count`. Record `retry_due_at` before each wait. The retries also retry a failed
       enqueue of step 0, the part that moved here from T037. Add to
       `backend/tests/component/git/writeback/test_enqueue.py` the case that moved here from T045: a
       flow whose own enqueue fails once and then returns delivers the entry, through a task with
       short retry delays.
-- [ ] T078 [US4] Make `RepositoryWritebackService.deliver` return `deferred` when `manual` is `False` and a
-      retry of another chain is due in the future, in `backend/infrahub/git/writeback/service.py`.
-- [ ] T079 [US4] Write `DeliveryRecoveryCheck` in `backend/infrahub/git/writeback/recovery.py` and run it
+- [X] T078 [US4] Make the first attempt only of `RepositoryWritebackService.deliver` return `deferred`,
+      in `backend/infrahub/git/writeback/service.py`: a chain's first automatic attempt
+      (`first_attempt` is `True`, `manual` is `False`) returns `deferred` when the retry of another
+      chain is due later. A later attempt of the chain never defers.
+- [X] T079 [US4] Write `DeliveryRecoveryCheck` in `backend/infrahub/git/writeback/recovery.py` and run it
       from the loop of `sync_remote_repositories` in `backend/infrahub/git/tasks.py`, for every
       repository, before the bootstrap and whatever the sync outcome, under its own guard. It submits
       with `tags=delivery_run_tags(repository.id)`. Write `PrefectDeliveryRunQuery` in
@@ -556,7 +564,7 @@ T081 to T084 are not.
       `read_flow_runs` call, and wire it in `build_recovery_check`. The check queries the
       orchestrator only when every other condition of a trigger holds, and submits nothing when the
       query raises (R20, contracts section 7).
-- [ ] T080 [US4] Write `backend/tests/unit/git/writeback/test_retry_and_recovery.py`, with a fake
+- [X] T080 [US4] Write `backend/tests/unit/git/writeback/test_retry_and_recovery.py`, with a fake
       `DeliveryRunQuery` in `backend/tests/unit/git/writeback/fakes.py`: the retry condition per cause,
       `final_attempt`, the deferred chain, the recovery check for a stale delivery (each of the five
       conditions, the free lock included) and for uncovered held work behind an empty queue, no
@@ -568,18 +576,18 @@ T081 to T084 are not.
       no query; every submission carries the delivery tags. Test `PrefectDeliveryRunQuery` against a
       fake `FlowRunQuerying` client: the filter holds both tags and the state types `SCHEDULED` and
       `PENDING`, with `limit=1`.
-- [ ] T081 [US4] Add `test_transient_fault_heals` to
+- [X] T081 [US4] Add `test_transient_fault_heals` to
       `backend/tests/integration/git/test_git_live_remote.py`: block the Gogs port for the first
-      attempt, open it, short delays through `with_options`.
-- [ ] T082 [US4] Add `test_lost_attempt_recovers` to the same module: kill the flow after the snapshot,
+      attempt, open it, short delays through `with_options`. One case blocks the port before the
+      fetch, the other after the fetch, so that the push fails.
+- [X] T082 [US4] Add `test_lost_attempt_recovers` to the same module: kill the flow after the snapshot,
       free the repository lock in the test, as the deadlock cleanup does for a dead worker (R20),
       age the state past the stale bound, run one sync cycle, and assert the delivery.
-- [ ] T083 [P] [US4] Add `test_policy_failure_is_not_retried` to the same module: one attempt only, then
+- [X] T083 [P] [US4] Add `test_policy_failure_is_not_retried` to the same module: one attempt only, then
       `action-required`.
-- [ ] T084 [P] [US4] Add two timeout cases to `backend/tests/unit/git/writeback/test_git_adapter.py`.
-      A push to a local TCP server that accepts and never answers fails as `remote-unreachable`
-      within the bound: this case waits for the open point of R6, because `kill_after_timeout` does
-      not stop that push. A `merge` of `replay` that stalls, through a `pre-merge-commit` hook of the
+- [X] T084 [P] [US4] Add two timeout cases to `backend/tests/unit/git/writeback/test_git_adapter.py`.
+      A local TCP server that accepts and never answers makes the push fail as `remote-unreachable`
+      within the bound. A `merge` of `replay` that stalls, through a `pre-merge-commit` hook of the
       temporary repository that `exec`s a long `sleep`, is killed within `LOCAL_GIT_TIMEOUT_SECONDS`,
       lowered for the test. It raises a `RepositoryError` that names the command, which the
       classifier gives `unclassified`, and no `index.lock` stays behind in the worktree. The hook uses
@@ -616,7 +624,8 @@ rule.** T094 is not.
       for flagged entries only; the release runs after the lock is released; `clear_released` keeps a
       later hold; a crash between the removal and the clear leaves a lease that expires, and the
       recovery check then releases the work; a release that fails sets the lease's expiry to now and
-      keeps the items held.
+      keeps the items held. The crash case runs the recovery check of T079: once the lease expires,
+      the check submits a delivery run, and that run releases the work.
 - [X] T089 [US5] Write `backend/tests/component/graphql/mutations/test_repository_delivery_abandon.py`: off
       the default branch, each permission missing, a stale version, nothing pending.
 - [X] T090 [US5] Add `test_conflict_then_abandon` to
@@ -648,17 +657,17 @@ and is not re-imported; retry; the branch is gone.
 
 **Maps to**: FR-010, FR-011. **In the deployment rule.**
 
-- [ ] T095 [US6] Change `git_branch_delete` in `backend/infrahub/git/tasks.py`: call
+- [X] T095 [US6] Change `git_branch_delete` in `backend/infrahub/git/tasks.py`: call
       `request_branch_deletion`, and when it returns true, skip the remote deletion, log why, and do
       not send `RefreshGitRepositoryBranchDeleted`.
-- [ ] T096 [US6] Confirm step 13 of `RepositoryWritebackService.deliver` deletes a flagged branch that no
+- [X] T096 [US6] Confirm step 13 of `RepositoryWritebackService.deliver` deletes a flagged branch that no
       remaining entry names, and add the case to `backend/tests/unit/git/writeback/test_service.py`.
 - [ ] T097 [US6] Add `test_remote_branch_kept_while_pending` to
       `backend/tests/integration/git/test_git_live_remote.py`, with
       `delete_branch_after_merge_reset_config` and `delete_git_branch_after_merge_reset_config`:
       kept, not re-imported by the sync as new or as updated, deleted after the retry; and, after an
       abandonment instead, kept on the remote and imported again as a new Infrahub branch.
-- [ ] T098 [P] [US6] Add a case to `backend/tests/component/git/writeback/test_enqueue.py`: a merge of
+- [X] T098 [P] [US6] Add a case to `backend/tests/component/git/writeback/test_enqueue.py`: a merge of
       another branch is not blocked while repository X has a pending delivery (FR-010).
 
 ---
@@ -674,7 +683,7 @@ and is not re-imported; retry; the branch is gone.
       cause `source-discarded`, the remote never holds the discarded commit.
 - [X] T100 [US7] Add `test_a_merge_onto_a_rewritten_trunk_is_refused` to the same module: force-push the
       remote default branch, retry, cause `destination-rewritten`, nothing pushed.
-- [ ] T101 [US7] Call `record_reverted` from IFC-3210's reconciliation of the default branch, per
+- [X] T101 [US7] Call `record_reverted` from IFC-3210's reconciliation of the default branch, per
       [research.md](research.md) R13, and add a test beside the sibling's reconciliation tests.
       **Gate: IFC-3210 rewrite classification on `develop`.**
 

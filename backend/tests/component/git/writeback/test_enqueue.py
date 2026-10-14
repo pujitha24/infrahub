@@ -3,14 +3,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from contextlib import asynccontextmanager, contextmanager, nullcontext
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, override
 from uuid import uuid4
 
 import pytest
+from prefect import flow
 from structlog.testing import capture_logs
 
 from infrahub import lock
@@ -31,23 +32,26 @@ from infrahub.core.merge.repository_merge_dispatcher import RepositoryMergeDispa
 from infrahub.core.node import Node
 from infrahub.core.registry import registry
 from infrahub.exceptions import DeliveryStateUnavailableError
+from infrahub.git import tasks as git_tasks
 from infrahub.git.models import GitRepositoryDeliveryRetry, GitRepositoryMerge
-from infrahub.git.tasks import merge_git_repository, retry_repository_delivery
+from infrahub.git.tasks import git_branch_delete, merge_git_repository, retry_repository_delivery
 from infrahub.git.writeback.constants import STATE_LOCK_ACQUIRE_SECONDS, STATE_LOCK_TTL_SECONDS
-from infrahub.git.writeback.models import DeliveryQueue, HeldRegeneration, HeldWiden
+from infrahub.git.writeback.models import DeliveryFailure, DeliveryQueue, HeldRegeneration, HeldWiden, PendingMerge
 from infrahub.git.writeback.service import REPOSITORY_LOCK_NAMESPACE
 from infrahub.git.writeback.store import STATE_LOCK_NAMESPACE, WritebackIntentStore
+from infrahub.message_bus.messages.refresh_git_repository_branch_deleted import RefreshGitRepositoryBranchDeleted
 from infrahub.workers.dependencies import build_client, build_message_bus
 from infrahub.workflows.catalogue import GIT_REPOSITORIES_MERGE
 from tests.adapters.message_bus import BusRecorder
 from tests.adapters.workflow import WorkflowRecorder
 from tests.helpers.dependency_override import override_dependency
 from tests.helpers.git import LocalRemote, build_repository_client, clone_repository
+from tests.helpers.workflow_override import override_workflow
 
 from .conftest import HELD_REGENERATION, QUEUE, SOURCE_COMMIT, pending_merge, read_attribute_writes
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
     from pathlib import Path
 
     from fast_depends import Provider
@@ -58,7 +62,7 @@ if TYPE_CHECKING:
     from infrahub.core.schema.schema_branch import SchemaBranch
     from infrahub.database import InfrahubDatabase
     from infrahub.git.repository import InfrahubRepository
-    from infrahub.git.writeback.models import PendingMerge, WritebackIntent
+    from infrahub.git.writeback.models import WritebackIntent
     from infrahub.lock import InfrahubLock
     from tests.adapters.lock.timeline import LockTimeline
 
@@ -69,6 +73,7 @@ MOVED_TRUNK_COMMIT = "c" * 40
 DISPATCHER_LOGGER = "tests.repository_merge_dispatcher"
 RUN_LOGGER = "infrahub.tasks"
 FLOW_LOGGER = "prefect.flow_runs"
+TASK_LOGGER = "prefect.task_runs"
 
 
 class RecordingSleep:
@@ -131,6 +136,7 @@ class ClonedRepository:
     """A repository whose remote is on disk, with its clone on this worker."""
 
     id: str
+    remote: LocalRemote
     clone: InfrahubRepository
     client: InfrahubClient
     trunk_commit: str
@@ -263,8 +269,8 @@ async def run_retry_flow(dependency_provider: Provider, client: InfrahubClient, 
 
 
 @asynccontextmanager
-async def held_lock(held: InfrahubLock) -> AsyncIterator[None]:
-    """Keep the lock taken by another worker for the time of the block."""
+async def held_lock(held: InfrahubLock) -> AsyncIterator[asyncio.Event]:
+    """Keep the lock taken by another worker until the block ends or the yielded event is set."""
     taken = asyncio.Event()
     released = asyncio.Event()
 
@@ -277,10 +283,41 @@ async def held_lock(held: InfrahubLock) -> AsyncIterator[None]:
     holder = asyncio.create_task(hold())
     await taken.wait()
     try:
-        yield
+        yield released
     finally:
         released.set()
         await holder
+
+
+class SetEventOnMessage(logging.Handler):
+    def __init__(self, *, event: asyncio.Event, message: str) -> None:
+        super().__init__()
+        self.event = event
+        self.message = message
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.getMessage() == self.message:
+            self.event.set()
+
+
+@contextmanager
+def set_on_log(event: asyncio.Event, logger_name: str, message: str) -> Iterator[None]:
+    """Set the event when the logger logs the message."""
+    handler = SetEventOnMessage(event=event, message=message)
+    logger = logging.getLogger(logger_name)
+    logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
+
+
+@pytest.fixture
+def immediate_delivery_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the retries of the delivery task with no wait, so a failing attempt does not sleep through the real delays."""
+    monkeypatch.setattr(
+        git_tasks, "deliver_pending_merges", git_tasks.deliver_pending_merges.with_options(retry_delay_seconds=0)
+    )
 
 
 @pytest.fixture
@@ -291,7 +328,8 @@ async def cloned_repository(
     tmp_path: Path,
     git_repos_dir: Path,
 ) -> ClonedRepository:
-    remote = LocalRemote.create(directory=tmp_path / "remote", trunk="main", branches=[])
+    # The remote checks out another branch, so it accepts a push to its trunk.
+    remote = LocalRemote.create(directory=tmp_path / "remote", trunk="main", branches=["parking"], head="parking")
     trunk_commit = remote.repo.commit("main").hexsha
     node = await create_repository_node(
         db=db, branch=default_branch, name=REPOSITORY_NAME, commit=trunk_commit, location=str(remote.directory)
@@ -308,6 +346,7 @@ async def cloned_repository(
     )
     return ClonedRepository(
         id=node.id,
+        remote=remote,
         clone=clone,
         client=client,
         trunk_commit=trunk_commit,
@@ -388,6 +427,52 @@ async def test_a_staging_repository_merges_with_no_queue_entry(
         )
     ]
     assert (await store.read(repository_id=repository.id)).queue == DeliveryQueue()
+
+
+async def test_a_merge_is_queued_behind_a_delivery_that_waits_for_an_action_and_its_merge_flow_is_submitted(
+    db: InfrahubDatabase, default_branch: Branch, register_core_models_schema: SchemaBranch
+) -> None:
+    repository = await create_repository_node(db=db, branch=default_branch, name=REPOSITORY_NAME)
+    source_branch = await fork_source_branch(db=db)
+    await set_values(db=db, branch=source_branch, repository_id=repository.id, commit=SOURCE_COMMIT)
+    store = build_store(db=db, default_branch=default_branch)
+    earlier = pending_merge(entry_id=str(uuid4()), source_git_branch="earlier-feature")
+    await store.enqueue(repository_id=repository.id, entry=earlier, widen=False)
+    await store.record_failure(
+        repository_id=repository.id,
+        failure=DeliveryFailure(
+            cause=RepositoryDeliveryFailureCause.PERMISSION, retryable=False, message="remote: Permission denied"
+        ),
+        final=True,
+        retry_due_at=None,
+    )
+    sleep = RecordingSleep()
+
+    workflow = await dispatch_merge(db=db, source_branch=source_branch, default_branch=default_branch, sleep=sleep)
+
+    (model,) = submitted_merges(workflow)
+    entry = model.pending_merge
+    assert entry is not None
+    assert model == GitRepositoryMerge(
+        repository_id=repository.id,
+        repository_name=REPOSITORY_NAME,
+        internal_status=RepositoryInternalStatus.ACTIVE.value,
+        source_branch=SOURCE_BRANCH,
+        destination_branch=default_branch.name,
+        destination_branch_id=str(default_branch.get_uuid()),
+        repository_kind=InfrahubKind.REPOSITORY,
+        source_commit=SOURCE_COMMIT,
+        pending_merge=entry,
+        pending_merge_enqueued=True,
+    )
+    assert (entry.source_branch, entry.source_git_branch, entry.source_commit, entry.delete_source_git_branch) == (
+        SOURCE_BRANCH,
+        SOURCE_BRANCH,
+        SOURCE_COMMIT,
+        False,
+    )
+    assert sleep.delays == []
+    assert (await store.read(repository_id=repository.id)).queue.entries == (earlier, entry)
 
 
 async def test_a_failed_enqueue_of_one_repository_still_submits_the_merge_of_the_others(
@@ -667,6 +752,7 @@ async def test_a_merge_flow_that_cannot_queue_its_entry_fails_and_names_the_merg
     prefect_test_fixture: None,
     dependency_provider: Provider,
     cloned_repository: ClonedRepository,
+    immediate_delivery_retries: None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     repository = cloned_repository
@@ -692,6 +778,59 @@ async def test_a_merge_flow_that_cannot_queue_its_entry_fails_and_names_the_merg
     intent = await build_store(db=db, default_branch=default_branch).read(repository_id=repository.id)
     assert intent.queue == DeliveryQueue()
     assert intent.held == HeldRegeneration()
+
+
+async def test_a_merge_flow_whose_enqueue_fails_once_delivers_the_entry_on_the_retry(
+    db: InfrahubDatabase,
+    default_branch: Branch,
+    prefect_test_fixture: None,
+    dependency_provider: Provider,
+    cloned_repository: ClonedRepository,
+    immediate_delivery_retries: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repository = cloned_repository
+    source_commit = repository.remote.commit(branch_name=SOURCE_BRANCH, files={"feature.txt": "feature\n"})
+    entry = PendingMerge(
+        entry_id=str(uuid4()),
+        source_branch=SOURCE_BRANCH,
+        source_git_branch=SOURCE_BRANCH,
+        source_commit=source_commit,
+        merged_at=datetime.now(UTC),
+    )
+    first_failure = (
+        f"The merge {entry.entry_id} of branch {SOURCE_BRANCH} was not queued for repository {REPOSITORY_NAME}; "
+        "the next attempt queues it."
+    )
+
+    # The first attempt waits for the held lock and fails, and its warning frees the lock for the retry.
+    async with held_lock(
+        lock.registry.get(name=repository.id, namespace=STATE_LOCK_NAMESPACE, ttl=STATE_LOCK_TTL_SECONDS)
+    ) as release:
+        with (
+            caplog.at_level(logging.WARNING, logger=RUN_LOGGER),
+            set_on_log(event=release, logger_name=RUN_LOGGER, message=first_failure),
+            override_workflow(WorkflowRecorder(), dependency_provider=dependency_provider),
+        ):
+            state = await run_merge_flow(
+                dependency_provider=dependency_provider,
+                client=repository.client,
+                model=repository.merge_model(entry=entry, enqueued=False),
+            )
+
+    assert state.is_completed()
+    assert state.message == f"The delivery to repository {REPOSITORY_NAME} ended with the outcome delivered."
+    assert log_lines(caplog, logger_name=RUN_LOGGER, level=logging.WARNING) == [first_failure]
+    remote = repository.remote.repo
+    delivered = remote.commit("main").hexsha
+    assert delivered != repository.trunk_commit
+    assert remote.is_ancestor(remote.commit(source_commit), remote.commit(delivered))
+    assert repository.clone.get_commit_value(branch_name="main", remote=False) == delivered
+    intent = await build_store(db=db, default_branch=default_branch).read(repository_id=repository.id)
+    assert intent.queue.entries == ()
+    assert intent.queue.removed_entry_ids == (entry.entry_id,)
+    assert intent.status == RepositoryDeliveryStatus.NONE
+    assert intent.last_delivered_commit == delivered
 
 
 async def test_a_merge_flow_whose_entry_is_refused_holds_no_full_regeneration(
@@ -899,3 +1038,129 @@ async def test_a_retry_that_waits_for_a_running_attempt_finds_nothing_to_push(
     intent = await store.read(repository_id=repository.id)
     assert (intent.status, intent.queue.entries) == (RepositoryDeliveryStatus.NONE, ())
     assert repository.clone.get_commit_value(branch_name="main", remote=False) == repository.trunk_commit
+
+
+@dataclass
+class BranchDeletionCase:
+    name: str
+    queued_git_branch: str
+    """The remote branch that the queued merge comes from."""
+    state_lock_held: bool
+    flagged: bool
+    remote_branches: list[str]
+    notified: list[str]
+    logged: list[tuple[int, str, type[BaseException] | None]]
+    """The level, the message and the type of the logged error of each warning or error."""
+
+
+BRANCH_DELETION_CASES: list[BranchDeletionCase] = [
+    BranchDeletionCase(
+        name="a_queued_merge_comes_from_the_branch",
+        queued_git_branch=SOURCE_BRANCH,
+        state_lock_held=False,
+        flagged=True,
+        remote_branches=[SOURCE_BRANCH, "main", "parking"],
+        notified=[],
+        logged=[
+            (
+                logging.WARNING,
+                f"Did not delete the Git branch '{SOURCE_BRANCH}' from repository '{REPOSITORY_NAME}', because a "
+                "pending delivery of the repository needs it. The delivery deletes the branch after it pushes the "
+                "merge, unless another queued merge comes from it. If the delivery is abandoned, the branch stays.",
+                None,
+            )
+        ],
+    ),
+    BranchDeletionCase(
+        name="no_queued_merge_comes_from_the_branch",
+        queued_git_branch="other-feature",
+        state_lock_held=False,
+        flagged=False,
+        remote_branches=["main", "parking"],
+        notified=[SOURCE_BRANCH],
+        logged=[],
+    ),
+    BranchDeletionCase(
+        name="the_check_for_a_queued_merge_fails",
+        queued_git_branch=SOURCE_BRANCH,
+        state_lock_held=True,
+        flagged=False,
+        remote_branches=[SOURCE_BRANCH, "main", "parking"],
+        notified=[],
+        logged=[
+            (
+                logging.ERROR,
+                f"Did not delete the Git branch '{SOURCE_BRANCH}' from repository '{REPOSITORY_NAME}', because the "
+                "check for a pending delivery that needs the branch failed. Delete the branch from the remote by hand "
+                "when the repository has no pending delivery.",
+                DeliveryStateUnavailableError,
+            )
+        ],
+    ),
+]
+
+
+@pytest.mark.parametrize("case", [pytest.param(case, id=case.name) for case in BRANCH_DELETION_CASES])
+async def test_a_branch_deletion_keeps_the_remote_branch_while_a_queued_merge_comes_from_it(
+    case: BranchDeletionCase,
+    db: InfrahubDatabase,
+    default_branch: Branch,
+    prefect_test_fixture: None,
+    dependency_provider: Provider,
+    cloned_repository: ClonedRepository,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repository = cloned_repository
+    repository.remote.create_branch(SOURCE_BRANCH)
+    await repository.clone.fetch()
+    store = build_store(db=db, default_branch=default_branch)
+    entry = pending_merge(entry_id=str(uuid4()), source_git_branch=case.queued_git_branch)
+    queued = await store.enqueue(repository_id=repository.id, entry=entry, widen=False)
+    bus = BusRecorder()
+
+    @flow(name="test-delete-a-git-branch-of-one-repository")
+    async def delete_the_git_branch() -> None:
+        await git_branch_delete(
+            client=repository.client,
+            branch=SOURCE_BRANCH,
+            repository_id=repository.id,
+            repository_name=REPOSITORY_NAME,
+            repository_location=str(repository.remote.directory),
+        )
+
+    state_lock = (
+        held_lock(lock.registry.get(name=repository.id, namespace=STATE_LOCK_NAMESPACE, ttl=STATE_LOCK_TTL_SECONDS))
+        if case.state_lock_held
+        else nullcontext()
+    )
+    with (
+        override_dependency(build_message_bus, lambda: bus, dependency_provider=dependency_provider),
+        caplog.at_level(logging.WARNING, logger=TASK_LOGGER),
+    ):
+        async with state_lock:
+            await delete_the_git_branch()
+
+    assert sorted(head.name for head in repository.remote.repo.heads) == case.remote_branches
+    assert [(type(message), message.model_dump(exclude={"meta"})) for message in bus.messages] == [
+        (
+            RefreshGitRepositoryBranchDeleted,
+            {
+                "repository_id": repository.id,
+                "repository_name": REPOSITORY_NAME,
+                "repository_kind": InfrahubKind.REPOSITORY,
+                "branch_name": branch_name,
+            },
+        )
+        for branch_name in case.notified
+    ]
+    assert [
+        (record.levelno, record.getMessage(), record.exc_info[0] if record.exc_info else None)
+        for record in caplog.records
+        if record.name == TASK_LOGGER and record.levelno >= logging.WARNING
+    ] == case.logged
+    assert await store.read(repository_id=repository.id) == replace(
+        queued,
+        queue=queued.queue.model_copy(
+            update={"entries": (entry.model_copy(update={"delete_source_git_branch": case.flagged}),)}
+        ),
+    )
