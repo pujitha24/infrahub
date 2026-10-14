@@ -604,8 +604,19 @@ class WritebackIntent:
             return cleared
         return replace(cleared, cause=None, error=None)
 
-    def with_reverted(self, *, reverted: RevertedDelivery) -> WritebackIntent:
-        return replace(self, reverted=reverted)
+    def without_delivered_commit(self) -> WritebackIntent:
+        return replace(self, last_delivered_commit=None)
+
+    def with_reverted(self, *, delivered_commit: str, new_head: str, now: datetime) -> WritebackIntent | None:
+        """Record the delivered commit that a rewrite discarded, or return None when the record already names it.
+
+        A later rewrite only finds the commit off the remote again, so the first record keeps its new head and time.
+        """
+        if self.reverted is not None and self.reverted.delivered_commit == delivered_commit:
+            return None
+        return replace(
+            self, reverted=RevertedDelivery(delivered_commit=delivered_commit, new_head=new_head, detected_at=now)
+        )
 
     def _with_status_of_queue(self) -> WritebackIntent:
         if self.queue.entries:
@@ -629,6 +640,16 @@ class WritebackIntent:
             return False
         retry_due_at = self.progress.retry_due_at
         if retry_due_at is not None and retry_due_at > now:
+            return False
+        last_progress_at = self.progress.last_progress_at
+        return last_progress_at is None or now - last_progress_at > timedelta(seconds=STALE_AFTER_SECONDS)
+
+    def release_waits(self, *, now: datetime) -> bool:
+        """Whether held regeneration that no live lease covers waits behind an empty queue, with no recent progress.
+
+        A queue with merges is left to the stale check, so a delivery that waits for a user action gets no new run.
+        """
+        if self.queue.entries or self.held.lease_window(now=now, max_hold_seq=None).is_empty:
             return False
         last_progress_at = self.progress.last_progress_at
         return last_progress_at is None or now - last_progress_at > timedelta(seconds=STALE_AFTER_SECONDS)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections import Counter
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -37,7 +38,7 @@ from infrahub.git.writeback.models import (
     RevertedDelivery,
     WritebackIntent,
 )
-from infrahub.git.writeback.store import STATE_LOCK_NAMESPACE, WritebackIntentStore
+from infrahub.git.writeback.store import STATE_LOCK_NAMESPACE, LeaseRenewer, WritebackIntentStore
 from tests.adapters.lock import LockAction, RecordingLockRegistry
 
 from .conftest import (
@@ -58,6 +59,8 @@ from .conftest import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
     from infrahub.database import InfrahubDatabase
     from infrahub.git.writeback.models import PendingMerge
 
@@ -646,6 +649,43 @@ async def test_renew_lease_moves_its_expiry(subject: StoreUnderTest) -> None:
     )
 
 
+async def test_lease_renewer_renews_beside_reads_on_the_session_that_it_gets(subject: StoreUnderTest) -> None:
+    rounds = 20
+    await _settle_with_a_hold_after_the_snapshot(subject, "artifact-1")
+    lease = await subject.store.lease_owed_release(repository_id=subject.repository_id)
+    assert lease is not None
+    subject.clock.advance(seconds=300)
+    outcomes: Counter[str] = Counter()
+
+    async def count_outcome(call: str, outcome: Awaitable[object]) -> None:
+        try:
+            await outcome
+        except Exception as exc:  # noqa: BLE001
+            outcomes[f"{call}: {type(exc).__name__}"] += 1
+        else:
+            outcomes[f"{call}: ok"] += 1
+
+    async with subject.db.start_session() as flow_db:
+        reader = WritebackIntentStore(
+            db=flow_db, lock_registry=subject.lock_registry, default_branch=subject.branch, clock=subject.clock
+        )
+        renewer = LeaseRenewer(
+            db=flow_db, lock_registry=subject.lock_registry, default_branch=subject.branch, clock=subject.clock
+        )
+        for _ in range(rounds):
+            await asyncio.gather(
+                count_outcome("read", reader.read(repository_id=subject.repository_id)),
+                count_outcome(
+                    "renewal", renewer.renew_lease(repository_id=subject.repository_id, lease_id=lease.lease_id)
+                ),
+            )
+
+    assert outcomes == Counter({"read: ok": rounds, "renewal: ok": rounds})
+    assert (await subject.read()).held.release_leases == (
+        lease.model_copy(update={"expires_at": NOW + timedelta(seconds=300) + LEASE_DURATION}),
+    )
+
+
 async def test_expired_lease_gives_its_items_to_the_next_lease_and_is_removed(subject: StoreUnderTest) -> None:
     await _settle_with_a_hold_after_the_snapshot(subject, "artifact-1")
     failed = await subject.store.lease_owed_release(repository_id=subject.repository_id)
@@ -687,18 +727,45 @@ async def test_clear_released_keeps_an_item_held_again_after_the_lease(subject: 
     )
 
 
-async def test_record_reverted_overwrites_the_previous_record(subject: StoreUnderTest) -> None:
-    first = RevertedDelivery(delivered_commit=DELIVERED_COMMIT, new_head=RECORDED_COMMIT, detected_at=NOW)
-    second = RevertedDelivery(
-        delivered_commit=RECORDED_COMMIT, new_head=SOURCE_COMMIT, detected_at=NOW + timedelta(hours=1)
+async def test_forget_delivered_commit_clears_it_once(subject: StoreUnderTest) -> None:
+    await _enqueue(subject, pending_merge("e1"))
+    snapshot = await subject.store.start_attempt(repository_id=subject.repository_id)
+    await subject.store.settle_delivery(
+        repository_id=subject.repository_id, snapshot=snapshot, delivered_commit=DELIVERED_COMMIT
+    )
+
+    async with subject.expect_transition(saved={LAST_DELIVERED_COMMIT}):
+        await subject.store.forget_delivered_commit(repository_id=subject.repository_id)
+    async with subject.expect_transition(saved=set()):
+        await subject.store.forget_delivered_commit(repository_id=subject.repository_id)
+
+    assert (await subject.read()).last_delivered_commit is None
+
+
+async def test_record_reverted_keeps_the_record_of_the_same_commit_and_overwrites_another(
+    subject: StoreUnderTest,
+) -> None:
+    async with subject.expect_transition(saved={REVERTED}):
+        assert await subject.store.record_reverted(
+            repository_id=subject.repository_id, delivered_commit=DELIVERED_COMMIT, new_head=RECORDED_COMMIT
+        )
+    subject.clock.advance(seconds=3600)
+    async with subject.expect_transition(saved=set()):
+        assert not await subject.store.record_reverted(
+            repository_id=subject.repository_id, delivered_commit=DELIVERED_COMMIT, new_head=SOURCE_COMMIT
+        )
+    assert (await subject.read()).reverted == RevertedDelivery(
+        delivered_commit=DELIVERED_COMMIT, new_head=RECORDED_COMMIT, detected_at=NOW
     )
 
     async with subject.expect_transition(saved={REVERTED}):
-        await subject.store.record_reverted(repository_id=subject.repository_id, reverted=first)
-    async with subject.expect_transition(saved={REVERTED}):
-        await subject.store.record_reverted(repository_id=subject.repository_id, reverted=second)
+        assert await subject.store.record_reverted(
+            repository_id=subject.repository_id, delivered_commit=RECORDED_COMMIT, new_head=SOURCE_COMMIT
+        )
 
-    assert (await subject.read()).reverted == second
+    assert (await subject.read()).reverted == RevertedDelivery(
+        delivered_commit=RECORDED_COMMIT, new_head=SOURCE_COMMIT, detected_at=NOW + timedelta(hours=1)
+    )
 
 
 async def test_pending_repository_ids_names_every_repository_with_a_status_other_than_none(

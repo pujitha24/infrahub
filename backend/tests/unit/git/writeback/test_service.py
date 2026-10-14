@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
-from infrahub_sdk.exceptions import ServerNotReachableError
+from infrahub_sdk.exceptions import ServerNotReachableError, ValidationError
 
 from infrahub.core.constants import FullRegenerationReason, RepositoryDeliveryFailureCause, RepositoryDeliveryStatus
 from infrahub.exceptions import (
@@ -17,8 +17,9 @@ from infrahub.exceptions import (
     DeliveryStateUnavailableError,
     RepositoryConnectionError,
     RepositoryCredentialsError,
-    ValidationError,
 )
+from infrahub.git.import_errors import RepositoryImportError
+from infrahub.git.writeback.constants import RELEASE_RENEW_SECONDS
 from infrahub.git.writeback.models import (
     AbandonmentRecord,
     Actor,
@@ -38,8 +39,11 @@ from tests.unit.git.writeback.fakes import (
     FixedClock,
     InMemoryDeliveryGit,
     InMemoryDeliveryState,
+    RecordingLeaseRenewal,
     RecordingRegenerationReleaser,
     Release,
+    Renewal,
+    RenewalAwaitingReleaser,
 )
 
 if TYPE_CHECKING:
@@ -198,7 +202,14 @@ def rig() -> Rig:
     git.remote_heads.update({"main": TRUNK, "feature": FEATURE, "other": OTHER})
     releaser = SteppedReleaser()
     service = RepositoryWritebackService(
-        repository=REPOSITORY, state=state, git=git, releaser=releaser, lock_registry=lock_registry, clock=clock
+        repository=REPOSITORY,
+        state=state,
+        git=git,
+        releaser=releaser,
+        lease_renewal=state,
+        lock_registry=lock_registry,
+        clock=clock,
+        release_renew_seconds=RELEASE_RENEW_SECONDS,
     )
     return Rig(clock=clock, state=state, git=git, releaser=releaser, lock=lock, service=service)
 
@@ -207,7 +218,7 @@ async def test_nothing_pending_does_nothing(rig: Rig) -> None:
     result = await rig.deliver()
 
     assert result == DeliveryAttemptResult(outcome=DeliveryOutcome.NOTHING_PENDING)
-    assert rig.state.calls == ["start_attempt"]
+    assert rig.state.calls == ["read", "start_attempt"]
     assert rig.git.calls == []
     assert rig.releaser.releases == []
 
@@ -221,6 +232,7 @@ async def test_entry_is_queued_before_the_snapshot_and_delivered(rig: Rig) -> No
     assert result == DeliveryAttemptResult(outcome=DeliveryOutcome.DELIVERED, commit=delivered)
     assert rig.state.calls == [
         "enqueue",
+        "read",
         "start_attempt",
         "progress",
         "progress",
@@ -806,20 +818,45 @@ class ImportFailureCase:
     failure: DeliveryFailure
 
 
+def _raised_by_the_import(*, error: Exception, message: str) -> RepositoryImportError:
+    """Wrap the error as the import does for every error but a connection or credentials error."""
+    wrapped = RepositoryImportError(identifier=REPOSITORY.name, branch_name="main", message=message)
+    wrapped.__cause__ = error
+    return wrapped
+
+
 IMPORT_FAILURE_CASES: list[ImportFailureCase] = [
     ImportFailureCase(
         name="interrupted_import_on_the_final_attempt",
-        error=DatabaseError(message="Unable to connect to the database"),
+        error=_raised_by_the_import(
+            error=DatabaseError(message="Unable to connect to the database"),
+            message="DatabaseError: Unable to connect to the database",
+        ),
         final_attempt=True,
         failure=DeliveryFailure(
             cause=RepositoryDeliveryFailureCause.IMPORT_INTERRUPTED,
             retryable=True,
-            message="Unable to connect to the database",
+            message="DatabaseError: Unable to connect to the database",
+        ),
+    ),
+    ImportFailureCase(
+        name="unreachable_remote_on_the_final_attempt",
+        error=RepositoryConnectionError(identifier="net-repo"),
+        final_attempt=True,
+        failure=DeliveryFailure(
+            cause=RepositoryDeliveryFailureCause.IMPORT_INTERRUPTED,
+            retryable=True,
+            message="Unable to clone the repository net-repo, please check the address and the credential",
         ),
     ),
     ImportFailureCase(
         name="invalid_content_before_the_final_attempt",
-        error=ValidationError(input_value="The artifact definition net-config has no target group."),
+        error=_raised_by_the_import(
+            error=ValidationError(
+                identifier="net-config", message="The artifact definition net-config has no target group."
+            ),
+            message="The artifact definition net-config has no target group.",
+        ),
         final_attempt=False,
         failure=DeliveryFailure(
             cause=RepositoryDeliveryFailureCause.IMPORT_FAILED,
@@ -911,6 +948,66 @@ async def test_release_runs_after_the_lock_is_released_and_renews_the_lease(rig:
     assert rig.state.calls[-3:] == ["settle_delivery", "renew_lease", "clear_released"]
 
 
+@dataclass
+class TimerRenewalCase:
+    name: str
+    renew_failures: list[BaseException]
+    warnings: list[tuple[str, type[BaseException]]]
+    """Each warning of the run logger, with the type of the error whose traceback it carries."""
+
+
+TIMER_RENEWAL_CASES: list[TimerRenewalCase] = [
+    TimerRenewalCase(name="the_timer_renews_the_lease_while_the_release_runs", renew_failures=[], warnings=[]),
+    TimerRenewalCase(
+        name="a_failed_renewal_is_a_warning_and_the_next_one_keeps_the_lease",
+        renew_failures=[DeliveryStateUnavailableError(repository_id=REPOSITORY.id, acquire_seconds=10)],
+        warnings=[("Failed to renew the release lease lease-1 of repository net-repo.", DeliveryStateUnavailableError)],
+    ),
+]
+
+
+@pytest.mark.parametrize("case", [pytest.param(case, id=case.name) for case in TIMER_RENEWAL_CASES])
+async def test_a_timer_renews_the_lease_while_the_release_runs_and_stops_before_the_clear(
+    case: TimerRenewalCase, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = FixedClock(now=NOW)
+    state = InMemoryDeliveryState(clock=clock, repository_names={REPOSITORY.id: REPOSITORY.name})
+    held = _held(HeldItem(id="definition-1", hold_seq=1))
+    state.intents[REPOSITORY.id] = replace(state.intents[REPOSITORY.id], held=held)
+    lease_renewal = RecordingLeaseRenewal()
+    lease_renewal.failures = list(case.renew_failures)
+    releaser = RenewalAwaitingReleaser(renewed_twice=lease_renewal.renewed_twice)
+    service = RepositoryWritebackService(
+        repository=REPOSITORY,
+        state=state,
+        git=InMemoryDeliveryGit(destination_git_branch=REPOSITORY.destination_git_branch, head=TRUNK),
+        releaser=releaser,
+        lease_renewal=lease_renewal,
+        lock_registry=InfrahubLockRegistry(local_only=True),
+        clock=clock,
+        release_renew_seconds=0.01,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=RUN_LOGGER):
+        result = await service.deliver(final_attempt=False, manual=False, entry=None)
+
+    assert result == DeliveryAttemptResult(outcome=DeliveryOutcome.RELEASED)
+    assert releaser.releases == [Release(repository_id=REPOSITORY.id, held=held)]
+    assert len(lease_renewal.renewals) >= 2
+    assert lease_renewal.renewals == [Renewal(repository_id=REPOSITORY.id, lease_id="lease-1")] * len(
+        lease_renewal.renewals
+    )
+    assert state.calls == ["read", "start_attempt", "lease_owed_release", "clear_released"]
+    # The timer ended before the run returned, so no renewal can follow the clear.
+    assert asyncio.all_tasks() == {asyncio.current_task()}
+    assert state.intents[REPOSITORY.id].held == HeldRegeneration()
+    assert [
+        (record.getMessage(), record.exc_info[0] if record.exc_info else None)
+        for record in caplog.records
+        if record.name == RUN_LOGGER and record.levelno == logging.WARNING
+    ] == case.warnings
+
+
 async def test_clear_removes_only_the_items_of_the_lease_window(rig: Rig) -> None:
     await rig.queue(_merge())
     await rig.hold("definition-1")
@@ -940,7 +1037,7 @@ async def test_held_only_run_under_a_live_lease_does_nothing(rig: Rig) -> None:
     result = await rig.deliver()
 
     assert result == DeliveryAttemptResult(outcome=DeliveryOutcome.NOTHING_PENDING)
-    assert rig.state.calls == ["start_attempt"]
+    assert rig.state.calls == ["read", "start_attempt"]
     assert rig.git.calls == []
     assert rig.releaser.releases == []
     assert rig.intent.held == before
@@ -1046,6 +1143,7 @@ SOURCE_BRANCH_CASES: list[SourceBranchCase] = [
         deleted=[],
         joining=_merge(entry_id="merge-3", source_branch="add-vlan-again", source_commit=OTHER),
     ),
+    SourceBranchCase(name="a_merge_that_joined_comes_from_another_branch", deleted=["feature"], joining=OTHER_MERGE),
     SourceBranchCase(
         name="a_failed_deletion_keeps_the_branch",
         deleted=[],
@@ -1071,6 +1169,7 @@ async def test_delivered_source_branch_is_deleted_when_no_queued_merge_needs_it(
     result = await rig.deliver()
 
     assert result.outcome == DeliveryOutcome.DELIVERED
+    assert rig.intent.queue.entries == (() if joining is None else (joining,))
     assert rig.git.deleted_branches == case.deleted
     assert rig.git.notified_branches == case.deleted
 
