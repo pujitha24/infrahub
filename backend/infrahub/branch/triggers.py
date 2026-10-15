@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from infrahub.events.branch_action import BranchDeletedEvent, BranchMergedEvent
 from infrahub.trigger.models import BuiltinTriggerDefinition, EventTrigger, ExecuteWorkflow, jinja_parameter
 from infrahub.workflows.catalogue import BRANCH_MERGED, BRANCH_PURGE_TASKS
@@ -21,6 +23,9 @@ TRIGGER_BRANCH_MERGED = BuiltinTriggerDefinition(
     ],
 )
 
+# Callers wait on a branch's flow runs by reading them until they settle, and read a purged run as an error.
+BRANCH_PURGE_TASKS_DELAY = timedelta(seconds=60)
+
 TRIGGER_BRANCH_DELETED_PURGE_TASKS = BuiltinTriggerDefinition(
     name="branch-deleted-purge-tasks-trigger",
     trigger=EventTrigger(
@@ -31,13 +36,8 @@ TRIGGER_BRANCH_DELETED_PURGE_TASKS = BuiltinTriggerDefinition(
             workflow=BRANCH_PURGE_TASKS,
             parameters={
                 "branch_name": jinja_parameter("{{ event.payload['data']['branch_name'] }}"),
-                # Prefect relates an event to the flow run that emitted it, here the run that deleted the branch.
-                "deleting_flow_run_id": jinja_parameter(
-                    "{% if 'flow-run' in event.resource_in_role %}"
-                    "{{ event.resource_in_role['flow-run'].id | replace('prefect.flow-run.', '') }}"
-                    "{% endif %}"
-                ),
             },
+            schedule_after=BRANCH_PURGE_TASKS_DELAY,
         ),
     ],
 )

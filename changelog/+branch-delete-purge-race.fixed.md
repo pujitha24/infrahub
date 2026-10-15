@@ -1,1 +1,1 @@
-Fixed deleting a branch sometimes returning an error after the branch was deleted, when the request waited for the deletion to finish.
+Fixed deleting a branch, or merging one when branches are deleted after merge, sometimes returning an error after it succeeded, when the request waited for it to finish.

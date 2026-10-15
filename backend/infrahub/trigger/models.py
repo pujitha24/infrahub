@@ -226,6 +226,7 @@ def jinja_parameter(template: str) -> dict[str, str]:
 class ExecuteWorkflow(BaseModel):
     workflow: WorkflowDefinition
     parameters: dict[str, Any] = Field(default_factory=dict)
+    schedule_after: timedelta = Field(default=timedelta(0))
 
     @property
     def name(self) -> str:
@@ -241,6 +242,7 @@ class ExecuteWorkflow(BaseModel):
             deployment_id=id,
             parameters=self.parameters,
             job_variables={},
+            schedule_after=self.schedule_after,
         )
 
     def validate_parameters(self) -> None:
