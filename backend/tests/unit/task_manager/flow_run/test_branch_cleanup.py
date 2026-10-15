@@ -156,6 +156,21 @@ class TestBranchFlowRunPurger:
         await _purger(client).purge_for_branch(branch_name=BRANCH_NAME)
 
         _assert_filter_scopes_to_branch_terminal_states(client.read_filters[0], branch_name=BRANCH_NAME)
+        assert client.read_filters[0] is not None
+        assert client.read_filters[0].id is None
+
+    async def test_excludes_the_run_that_deleted_the_branch(self) -> None:
+        deleting_run = make_run()
+        client = InMemoryPurgeClient(flow_runs=[make_run()])
+
+        await _purger(client).purge_for_branch(branch_name=BRANCH_NAME, deleting_flow_run_id=deleting_run.id)
+
+        flow_run_filter = client.read_filters[0]
+        _assert_filter_scopes_to_branch_terminal_states(flow_run_filter, branch_name=BRANCH_NAME)
+        assert flow_run_filter is not None
+        assert flow_run_filter.id is not None
+        assert flow_run_filter.id.any_ is None
+        assert flow_run_filter.id.not_any_ == [deleting_run.id]
 
     async def test_pages_through_multiple_batches(self) -> None:
         runs = [make_run() for _ in range(3)]

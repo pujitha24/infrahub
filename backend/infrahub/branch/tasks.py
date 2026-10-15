@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 from prefect import flow, get_client
 from prefect.logging import get_run_logger
 
@@ -37,10 +39,13 @@ async def branch_merged(
 
 
 @flow(name="branch-purge-tasks", flow_run_name="Purge tasks for deleted branch '{branch_name}'")
-async def purge_deleted_branch_tasks(branch_name: str) -> None:
+async def purge_deleted_branch_tasks(branch_name: str, deleting_flow_run_id: str | None = None) -> None:
     log = get_run_logger()
     async with get_client(sync_client=False) as prefect_client:
         purger = BranchFlowRunPurger(
             client=PrefectClientAdapter(client=prefect_client), filter_builder=FlowRunFilterBuilder(), log=log
         )
-        await purger.purge_for_branch(branch_name=branch_name)
+        await purger.purge_for_branch(
+            branch_name=branch_name,
+            deleting_flow_run_id=UUID(deleting_flow_run_id) if deleting_flow_run_id else None,
+        )
