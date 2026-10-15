@@ -80,9 +80,10 @@ function createGraphqlClient(branch?: string | null, date?: Date | null): Client
 function toGraphQLResult<TData>(
   data: TData | undefined,
   error: CombinedError | undefined,
-  context?: GraphQLRequestContext
+  context?: GraphQLRequestContext,
+  options?: { isMutation?: boolean }
 ): GraphQLResult<TData> {
-  handleGraphQLErrors(error, context);
+  handleGraphQLErrors(error, context, options);
 
   if (error?.networkError) {
     throw error.networkError;
@@ -130,6 +131,6 @@ export const graphqlClient = {
     const result = await createGraphqlClient(args.context?.branch, args.context?.date)
       .mutation<TData, TVars>(args.mutation, args.variables as TVars)
       .toPromise();
-    return toGraphQLResult(result.data, result.error, args.context);
+    return toGraphQLResult(result.data, result.error, args.context, { isMutation: true });
   },
 };

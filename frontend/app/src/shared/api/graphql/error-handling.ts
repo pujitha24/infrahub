@@ -43,7 +43,8 @@ function notifyUser(
 
 export function handleGraphQLErrors(
   error: CombinedError | undefined,
-  context?: GraphQLRequestContext
+  context?: GraphQLRequestContext,
+  { isMutation = false }: { isMutation?: boolean } = {}
 ): void {
   if (!error?.graphQLErrors?.length) return;
 
@@ -75,7 +76,9 @@ export function handleGraphQLErrors(
       }
 
       case ERROR_CODES.PERMISSION_DENIED: {
-        // 403s are handled by route-level guards; `continue` so sibling errors still route.
+        // A denied query is handled by route-level guards; a denied mutation has no guard behind it.
+        if (!isMutation) continue;
+        notifyUser(graphQLError.message, context);
         continue;
       }
 

@@ -109,7 +109,23 @@ describe("handleGraphQLErrors — catalogue routing", () => {
     expect(assignSpy).toHaveBeenCalledOnce();
   });
 
-  it("stays silent on PERMISSION_DENIED (no redirect, no override call)", () => {
+  it("surfaces PERMISSION_DENIED on a mutation through processErrorMessage without redirecting", () => {
+    // GIVEN
+    const processErrorMessage = vi.fn();
+
+    // WHEN
+    handleGraphQLErrors(
+      combinedError(ERROR_CODES.PERMISSION_DENIED, "not allowed"),
+      { processErrorMessage },
+      { isMutation: true }
+    );
+
+    // THEN
+    expect(assignSpy).not.toHaveBeenCalled();
+    expect(processErrorMessage).toHaveBeenCalledWith("not allowed");
+  });
+
+  it("stays silent on PERMISSION_DENIED for a query (route guards own it)", () => {
     // GIVEN
     const processErrorMessage = vi.fn();
 
