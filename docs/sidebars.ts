@@ -126,7 +126,7 @@ const sidebars: SidebarsConfig = {
             { type: 'doc', id: 'schema/remove-schema-elements', label: 'Remove schema elements' },
           ],
         },
-        { type: 'doc', id: 'schema/marketplace/index', label: 'Marketplace' },
+        { type: 'doc', id: 'schema/marketplace/index', label: 'Schema Marketplace' },
         // ── Advanced schema features ──────────────────────────
         {
           type: 'category',
